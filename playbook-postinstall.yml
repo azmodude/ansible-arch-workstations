@@ -1,0 +1,124 @@
+---
+# Do postinstall tasks in chroot after archinstall finished
+- hosts: localhost
+  connection: local
+
+  tasks:
+    - name: Setup cachyos
+      block:
+        - name: Create temporary directory
+          ansible.builtin.tempfile:
+            state: directory
+            prefix: archinstall
+          register: tempfile
+        - name: Download cachyos setup script
+          ansible.builtin.get_url:
+            url: https://mirror.cachyos.org/cachyos-repo.tar.xz
+            dest: "{{ tempfile.path }}"
+            mode: "0644"
+          register: cachyos_script
+        - name: Unarchive cachyos setup script
+          ansible.builtin.unarchive:
+            src: "{{ cachyos_script.dest }}"
+            dest: "{{ tempfile.path }}"
+        - name: Patch script to make pacman perform unattended
+          ansible.builtin.replace:
+            path: "{{ tempfile.path}}/cachyos-repo/cachyos-repo.sh"
+            regexp: '(\s+)(pacman)\s+(.*)$'
+            replace: '\1\2 --noconfirm \3'
+            backup: true
+        - name: Run cachyos setup script (this might take a while)
+          ansible.builtin.command:
+            cmd: "./cachyos-repo.sh --install"
+            chdir: "{{ tempfile.path }}/cachyos-repo/"
+            creates: /etc/pacman.conf.bak
+      always:
+        - name: Delete temporary directory
+          ansible.builtin.file:
+            path: "{{ tempfile.path }}"
+            state: absent
+
+    - name: Setup cachyos kernel and ZFS support
+      block:
+        - name: Install cachyos kernel, ZFS module and zfs-utils
+          community.general.pacman:
+            name: "{{ item }}"
+            state: present
+            reason: explicit
+            update_cache: true
+          loop:
+            - linux-cachyos
+            - linux-cachyos-zfs
+            - zfs-utils
+        - name: Create mkinitcpio UKI preset for cachyos kernel
+          ansible.builtin.copy:
+            dest: /etc/mkinitcpio.d/linux-cachyos.preset
+            content: |
+              # mkinitcpio preset file for the 'linux-cachyos' package
+              #ALL_config="/etc/mkinitcpio.conf"
+              ALL_kver="/boot/vmlinuz-linux-cachyos"
+
+              PRESETS=('default' 'fallback')
+
+              #default_config="/etc/mkinitcpio.conf"
+              #default_image="/boot/initramfs-linux-cachyos.img"
+              default_uki="/boot/EFI/Linux/arch-linux-cachyos.efi"
+              default_options="--splash /usr/share/systemd/bootctl/splash-arch.bmp"
+
+              #fallback_config="/etc/mkinitcpio.conf"
+              #fallback_image="/boot/initramfs-linux-cachyos-fallback.img"
+              fallback_uki="/boot/EFI/Linux/arch-linux-cachyos-fallback.efi"
+              fallback_options="-S autodetect"
+            backup: true
+          register: mkinitcpio
+        - name: Run mkinitcpio when preset changed
+          ansible.builtin.command:
+            cmd: "mkinitcpio -p linux-cachyos"
+          when: mkinitcpio.changed
+
+    - name: Setup Chaotic AUR
+      block:
+        - name: Get Chaotic AUR keys
+          community.general.pacman_key:
+            id: "ef925ea60f33d0cb85c44ad13056513887b78aeb"
+            # id: "3056513887B78AEB"
+            keyserver: keyserver.ubuntu.com
+            state: present
+        - name: Install Chaotic AUR keyring and mirrorlists
+          community.general.pacman:
+            name: "{{ item }}"
+            state: present
+            reason: explicit
+          loop:
+            - "https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst"
+            - "https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist.pkg.tar.zst"
+        - name: Add Chaotic AUR to pacman.conf
+          ansible.builtin.blockinfile:
+            path: /etc/pacman.conf
+            append_newline: true
+            prepend_newline: true
+            block: |
+              [chaotic-aur]
+              Include = /etc/pacman.d/chaotic-mirrorlist
+          register: chaotic
+        - name: Update pacman cache
+          community.general.pacman:
+            update_cache: true
+          when: chaotic.changed
+
+    - name: Install AUR helper
+      community.general.pacman:
+        name: paru
+        state: present
+
+    - name: Ensure openssh is installed and enabled
+      block:
+        - name: Ensure openssh is installed
+          community.general.pacman:
+            name: openssh
+            state: present
+        - name: Ensure openssh is enabled
+          ansible.builtin.systemd_service:
+            name: sshd.service
+            enabled: true
+# vim: ft=yaml.ansible
